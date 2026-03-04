@@ -2,7 +2,13 @@ import matplotlib
 import matplotlib.artist
 import matplotlib.pyplot
 
-from .transformer import ProbabilisticTransformer, HybridProbabilisticTransformer
+from .transformer import (
+    ProbabilisticTransformer,
+    HybridProbabilisticTransformer,
+    HybridProbabilisticTransformerReflectedOU,
+    HybridProbabilisticTransformerCIR,
+    HybridProbabilisticTransformerPostHocFloor,
+)
 from .heads import JohnsonSUHead, GaussianHead, DistributionHead
 try:
     from .lstm import ProbabilisticLSTM
@@ -26,5 +32,9 @@ except ImportError:
     pass
 try:
     from .qlear import QLear
+except ImportError:
+    pass
+try:
+    from .persistence_residual import PersistenceResidual
 except ImportError:
     pass

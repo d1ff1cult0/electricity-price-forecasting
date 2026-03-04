@@ -32,16 +32,20 @@ class Evaluator:
         # Compute deterministic metrics
         mae = np.mean(np.abs(y_test - means_original))
         mse = np.mean((y_test - means_original)**2)
+        # MAPE
+        mask = y_test != 0
+        mape = np.mean(np.abs((y_test[mask] - means_original[mask]) / y_test[mask])) * 100 if mask.any() else np.nan
 
-        
         # Compute probabilistic Metrics
         alpha = 0.05
         q_lower = alpha / 2  # 0.025
         q_upper = 1 - (alpha / 2)  # 0.975
-        
+        q_pinball = [0.1, 0.5, 0.9]  # for Pinball losses
+
         # quantiles in scaled space
         params_flat = y_pred_params.reshape(-1, y_pred_params.shape[-1])
-        quantiles_dict = self.model.head.quantiles(params_flat, [q_lower, q_upper])
+        all_quantiles = [q_lower, q_upper] + q_pinball
+        quantiles_dict = self.model.head.quantiles(params_flat, all_quantiles)
         # lower quantile
         q_low_scaled = quantiles_dict[q_lower].reshape(y_pred_params.shape[0], -1)
         _, q_low_original = self.transform.inverse_transform(X=None, y=q_low_scaled)
@@ -52,7 +56,9 @@ class Evaluator:
         covered = (y_test >= q_low_original) & (y_test <= q_high_original)
         picp = np.mean(covered)
         mpiw = np.mean(q_high_original - q_low_original)
-        
+        y_range = np.max(y_test) - np.min(y_test)
+        pinaw = mpiw / y_range if y_range > 0 else np.nan
+
         # Interval score
         # IS = (U - L) + 2/alpha * (L - y) * I(y < L) + 2/alpha *(y - U) * I(y > U)
         width = q_high_original - q_low_original
@@ -85,15 +91,38 @@ class Evaluator:
         
         crps_per_element = term1 - term2_final
         crps = np.mean(crps_per_element)
+
+        # Pinball loss
+        def _pinball(y_true, y_pred_q, q):
+            err = y_true - y_pred_q
+            return np.mean(np.maximum(q * err, (q - 1.0) * err))
+
+        pinball_metrics = {}
+        for q in q_pinball:
+            q_scaled = quantiles_dict[q].reshape(y_pred_params.shape[0], -1)
+            _, q_original = self.transform.inverse_transform(X=None, y=q_scaled)
+            pinball_metrics[f"Pinball_{int(q*100)}"] = _pinball(y_test, q_original, q)
+        avg_pinball = np.mean(list(pinball_metrics.values()))
+        pinball_metrics["Avg_Pinball"] = avg_pinball
+
+        # NLL (Negative Log-Likelihood)
+        nll = np.nan
+        if hasattr(self.model.head, "log_pdf_np"):
+            log_pdf = self.model.head.log_pdf_np(y_pred_params, y_test)
+            nll = -np.mean(log_pdf)
         
         metrics = {
             "MAE": mae,
             "MSE": mse,
             "RMSE": np.sqrt(mse),
+            "MAPE": mape,
             "PICP": picp,
             "MPIW": mpiw,
+            "PINAW": pinaw,
             "IntervalScore": interval_score,
-            "CRPS": crps
+            "CRPS": crps,
+            "NLL": nll,
+            **pinball_metrics,
         }
         
         return metrics

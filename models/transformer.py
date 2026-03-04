@@ -8,7 +8,16 @@ import numpy as np
 from typing import Optional, Dict, List
 
 from config import ModelConfig, ExperimentConfig
-from .heads import DistributionHead, JohnsonSUHead, GaussianHead, QuantileHead, MixtureGaussianHead, MixtureJohnsonSUHead
+from .heads import (
+    DistributionHead,
+    JohnsonSUHead,
+    JohnsonSUFloorHead,
+    TruncatedNormalHead,
+    GaussianHead,
+    QuantileHead,
+    MixtureGaussianHead,
+    MixtureJohnsonSUHead,
+)
 
 class ProbabilisticTransformer:
     # Modular Probabilistic Transformer
@@ -35,6 +44,12 @@ class ProbabilisticTransformer:
         elif config.head_type == "mixture_johnson_su":
             n_components = head_params.get("n_components", 3)
             self.head = MixtureJohnsonSUHead(n_components=n_components)
+        elif config.head_type == "johnson_su_floor":
+            floor_w = head_params.get("floor_penalty_weight", 0.1)
+            asym_w = head_params.get("asymmetric_weight", 1.5)
+            self.head = JohnsonSUFloorHead(floor_penalty_weight=floor_w, asymmetric_weight=asym_w)
+        elif config.head_type == "truncated_normal":
+            self.head = TruncatedNormalHead()
         else:
             raise ValueError(f"Unknown head type: {config.head_type}")
             
@@ -250,6 +265,149 @@ class OrnsteinUhlenbeckProcess:
         return path
 
 
+class ReflectedOUProcess:
+    # Ornstein-Uhlenbeck process with reflection at 0, Keeps process >= 0
+
+    def __init__(self, dt: float = 1.0):
+        self.dt = dt
+        self.k = 0.0
+        self.mu = 0.0
+        self.sigma = 0.0
+
+    def fit(self, residuals: np.ndarray):
+        # Fit using same MLE as OU, ensure mu >= 0 for reflection to make sense
+        ou = OrnsteinUhlenbeckProcess(dt=self.dt)
+        ou.fit(residuals)
+        self.k = ou.k
+        self.mu = max(ou.mu, 0.01)  # positive mean reversion level
+        self.sigma = ou.sigma
+
+    def simulate(self, current_x: np.ndarray, steps: int, n_paths: int = 1) -> np.ndarray:
+        # Simulate OU paths with reflection at 0
+        if np.ndim(current_x) == 0:
+            current_x = np.array([current_x])
+
+        n_samples = len(current_x)
+        paths = np.zeros((n_samples, steps, n_paths))
+
+        x_t = np.tile(np.maximum(current_x[:, np.newaxis], 0.0), (1, n_paths))
+        k, mu, dt, sigma = self.k, self.mu, self.dt, self.sigma
+
+        if k > 1e-12:
+            exp_neg_k_dt = np.exp(-k * dt)
+            cond_var = (sigma**2 / (2.0 * k)) * (1.0 - np.exp(-2.0 * k * dt))
+            cond_std = np.sqrt(max(cond_var, 0.0))
+        else:
+            exp_neg_k_dt = 1.0
+            cond_std = sigma * np.sqrt(dt)
+
+        for t in range(steps):
+            cond_mean = mu + (x_t - mu) * exp_neg_k_dt
+            noise = np.random.normal(0, 1, size=(n_samples, n_paths))
+            x_t = np.maximum(cond_mean + cond_std * noise, 0.0)
+            paths[:, t, :] = x_t
+
+        return paths
+
+    def mean_path(self, current_x: np.ndarray, steps: int) -> np.ndarray:
+        # Deterministic mean path
+        if np.ndim(current_x) == 0:
+            current_x = np.array([current_x])
+        n_samples = len(current_x)
+        path = np.zeros((n_samples, steps))
+        x_0 = np.maximum(current_x, 0.0)
+        k, mu, dt = self.k, self.mu, self.dt
+        for t in range(steps):
+            elapsed = (t + 1) * dt
+            if k > 1e-12:
+                path[:, t] = mu + (x_0 - mu) * np.exp(-k * elapsed)
+            else:
+                path[:, t] = x_0
+        return path
+
+
+class CIRProcess:
+    # Cox-Ingersoll-Ross (Feller) process: dX = k(theta - X)dt + sigma*sqrt(X)dW. X >= 0
+
+    def __init__(self, dt: float = 1.0):
+        self.dt = dt
+        self.k = 0.0
+        self.theta = 0.0
+        self.sigma = 0.0
+
+    def fit(self, residuals: np.ndarray):
+        # Fit CIR to non-negative residuals
+
+        x = np.maximum(residuals, 1e-6)
+        N = len(x) - 1
+        if N < 2:
+            self.k = 0.1
+            self.theta = float(max(np.mean(x), 0.01))
+            self.sigma = float(max(np.std(x) * 0.5, 1e-6))
+            return
+
+        x_t, x_prev = x[1:], x[:-1]
+        dt = self.dt
+
+        theta = np.mean(x)
+        k = 0.5
+        for _ in range(50):
+            k_old = k
+            drift = (theta - x_prev) * dt
+            denom = np.mean(drift ** 2) + 1e-10
+            k = np.mean((x_t - x_prev) * drift) / denom
+            k = np.clip(k, 1e-6, 10.0)
+            if abs(k - k_old) < 1e-6:
+                break
+
+        residuals_sq = (x_t - x_prev - k * (theta - x_prev) * dt) ** 2
+        sigma2 = np.mean(residuals_sq) / (dt * np.mean(x_prev) + 1e-10)
+        sigma = np.sqrt(max(sigma2, 1e-10))
+
+        self.k = float(k)
+        self.theta = float(max(theta, 0.01))
+        self.sigma = float(sigma)
+
+    def simulate(self, current_x: np.ndarray, steps: int, n_paths: int = 1) -> np.ndarray:
+        """Euler-Maruyama for CIR. Use absorption at 0 for negative values."""
+        if np.ndim(current_x) == 0:
+            current_x = np.array([current_x])
+
+        n_samples = len(current_x)
+        paths = np.zeros((n_samples, steps, n_paths))
+
+        x_t = np.tile(np.maximum(current_x[:, np.newaxis], 1e-8), (1, n_paths))
+        k, theta, dt, sigma = self.k, self.theta, self.dt, self.sigma
+
+        for t in range(steps):
+            sqrt_x = np.sqrt(np.maximum(x_t, 1e-12))
+            drift = k * (theta - x_t) * dt
+            diff = sigma * sqrt_x * np.sqrt(dt)
+            noise = np.random.normal(0, 1, size=(n_samples, n_paths))
+            x_t = np.maximum(x_t + drift + diff * noise, 0.0)
+            paths[:, t, :] = x_t
+
+        return paths
+
+    def mean_path(self, current_x: np.ndarray, steps: int) -> np.ndarray:
+        # E[CIR] = theta + (x_0 - theta)*exp(-k*t)
+        if np.ndim(current_x) == 0:
+            current_x = np.array([current_x])
+
+        n_samples = len(current_x)
+        path = np.zeros((n_samples, steps))
+        k, theta = self.k, self.theta
+        x_0 = np.maximum(current_x, 0.0)
+
+        for t in range(steps):
+            elapsed = (t + 1) * self.dt
+            if k > 1e-12:
+                path[:, t] = theta + (x_0 - theta) * np.exp(-k * elapsed)
+            else:
+                path[:, t] = x_0
+        return path
+
+
 class HybridProbabilisticTransformer(ProbabilisticTransformer):
     # Extends ProbabilisticTransformer with OU process for residuals
 
@@ -376,4 +534,83 @@ class HybridProbabilisticTransformer(ProbabilisticTransformer):
             results[q] = np.quantile(samples, q, axis=-1)
             
         return results
+
+
+class HybridProbabilisticTransformerReflectedOU(HybridProbabilisticTransformer):
+    # Hybrid Transformer + Reflected OU (residuals reflected at 0)
+
+    def __init__(self, config: ExperimentConfig):
+        super().__init__(config)
+        self.ou_process = ReflectedOUProcess(dt=1.0)
+
+    def fit_ou(self, X_train, y_train):
+        super().fit_ou(X_train, y_train)
+        self.ou_process.mu = max(self.ou_process.mu, 0.01)
+
+
+class HybridProbabilisticTransformerCIR(HybridProbabilisticTransformer):
+    # Hybrid Transformer + CIR process for non-negative residuals
+
+    def __init__(self, config: ExperimentConfig):
+        super().__init__(config)
+        self.ou_process = CIRProcess(dt=1.0)
+
+    def fit_ou(self, X_train, y_train):
+        # Fit CIR on max(residuals, 0) + epsilon
+        print("Fitting CIR process on training residuals")
+        y_pred_dist = self.keras_model.predict(X_train, batch_size=2048, verbose=0)
+
+        if hasattr(self.head, "mean"):
+            flat_params = y_pred_dist.reshape(-1, y_pred_dist.shape[-1])
+            flat_means = self.head.mean(flat_params)
+            y_pred_means = flat_means.reshape(y_train.shape)
+            all_residuals = y_train - y_pred_means
+            n_windows, horizon = all_residuals.shape
+
+            k_est, theta_est, sigma_est = [], [], []
+            temp_cir = CIRProcess(dt=self.ou_process.dt)
+            for i in range(n_windows):
+                r = np.maximum(all_residuals[i, :], 1e-6)
+                if len(r) < 3:
+                    continue
+                temp_cir.fit(r)
+                if temp_cir.k > 1e-6 and temp_cir.sigma > 1e-6:
+                    k_est.append(temp_cir.k)
+                    theta_est.append(temp_cir.theta)
+                    sigma_est.append(temp_cir.sigma)
+
+            if len(k_est) > 10:
+                self.ou_process.k = float(np.median(k_est))
+                self.ou_process.theta = float(np.median(theta_est))
+                self.ou_process.sigma = float(np.median(sigma_est))
+            else:
+                concat = np.maximum(all_residuals.flatten(), 1e-6)
+                self.ou_process.fit(concat)
+
+            self._train_residuals = all_residuals
+            print(f"CIR Params: k={self.ou_process.k:.4f}, theta={self.ou_process.theta:.4f}, sigma={self.ou_process.sigma:.4f}")
+        else:
+            super().fit_ou(X_train, y_train)
+
+    def compute_last_residual(self, X) -> np.ndarray:
+        r = super().compute_last_residual(X)
+        return np.maximum(r, 0.0)
+
+    def predict_hybrid(self, X, last_residuals: np.ndarray = None):
+        return super().predict_hybrid(X, last_residuals)
+
+    def sample_hybrid(self, X, n_samples: int = 100, last_residuals: np.ndarray = None):
+        return super().sample_hybrid(X, n_samples, last_residuals)
+
+
+class HybridProbabilisticTransformerPostHocFloor(HybridProbabilisticTransformer):
+    # Hybrid Transformer + OU with floor: max(pred, 0)
+
+    def predict_hybrid(self, X, last_residuals: np.ndarray = None):
+        pred = super().predict_hybrid(X, last_residuals)
+        return np.maximum(pred, 0.0)
+
+    def sample_hybrid(self, X, n_samples: int = 100, last_residuals: np.ndarray = None):
+        samples = super().sample_hybrid(X, n_samples, last_residuals)
+        return np.maximum(samples, 0.0)
 
