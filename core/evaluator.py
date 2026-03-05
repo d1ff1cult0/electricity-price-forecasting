@@ -35,6 +35,10 @@ class Evaluator:
         # MAPE
         mask = y_test != 0
         mape = np.mean(np.abs((y_test[mask] - means_original[mask]) / y_test[mask])) * 100 if mask.any() else np.nan
+        # R2
+        ss_res = np.sum((y_test - means_original) ** 2)
+        ss_tot = np.sum((y_test - np.mean(y_test)) ** 2)
+        r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else np.nan
 
         # Compute probabilistic Metrics
         alpha = 0.05
@@ -116,6 +120,7 @@ class Evaluator:
             "MSE": mse,
             "RMSE": np.sqrt(mse),
             "MAPE": mape,
+            "R2": r2,
             "PICP": picp,
             "MPIW": mpiw,
             "PINAW": pinaw,
