@@ -344,6 +344,11 @@ class ENTSOEDatasetGenerator:
         final_df = final_df.sort_index()
         final_df = final_df[~final_df.index.duplicated(keep="first")]
         
+        # Resample to hourly (ENTSOE switched from hourly to 15-min on ~30/09/2025)
+        # Keeps data consistent: aggregate 15-min points to hourly via mean
+        final_df = self.safe_resample(final_df, freq='1h')
+        final_df = final_df.dropna(how='all')
+        
         # Clip to exact date range
         final_df = final_df.loc[(final_df.index >= start) & (final_df.index < end)]
         
