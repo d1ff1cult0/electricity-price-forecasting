@@ -366,11 +366,25 @@ def run_experiment(
         print(f"[{exp_name}] found in cache — skipping.")
         return cache[exp_name]
 
+    results_dir = Path(results_base_dir) / exp_name.replace(" ", "_")
+    summary_file = results_dir / "summary.json"
+    if summary_file.exists():
+        try:
+            with open(summary_file, "r") as f:
+                summary = json.load(f)
+            avg = summary.get("avg", {})
+            if avg:
+                print(f"[{exp_name}] found on disk ({summary_file}) — skipping.")
+                if cache is not None:
+                    cache[exp_name] = avg
+                return avg
+        except (json.JSONDecodeError, KeyError):
+            pass
+
     model_config = model_config or ModelConfig(**CANONICAL_MODEL_CONFIG)
     train_config = train_config or TrainingConfig(**CANONICAL_TRAIN_CONFIG)
     head_params = head_params or {}
 
-    results_dir = Path(results_base_dir) / exp_name.replace(" ", "_")
     results_dir.mkdir(parents=True, exist_ok=True)
 
     config_snapshot = {
