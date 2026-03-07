@@ -15,15 +15,15 @@ class ModelConfig:
     d_model: int = 224
     num_heads: int = 7
     num_layers: int = 3
-    ff_dim: int = 448
+    ff_dim: int = 256
     dropout: float = 0.15
 
 @dataclass
 class TrainingConfig:
     batch_size: int = 32
-    epochs: int = 50
+    epochs: int = 30
     learning_rate: float = 7e-4
-    patience: int = 10
+    patience: int = 5
     validation_split: float = 0.1
     random_state: int = 42
 

@@ -133,11 +133,44 @@ class Evaluator:
         return metrics
 
     def generate_forecasts(self, X_test_scaled: np.ndarray) -> np.ndarray:
-        """
-        generates mean forecasts in original scale
-        """
+        """Return mean forecasts in original scale."""
         y_pred_params = self.model.keras_model.predict(X_test_scaled, verbose=0)
         means_scaled = self.model.head.mean(y_pred_params.reshape(-1, y_pred_params.shape[-1]))
         means_scaled = means_scaled.reshape(y_pred_params.shape[0], -1)
         _, means_original = self.transform.inverse_transform(X=None, y=means_scaled)
         return means_original
+
+    def generate_quantile_forecasts(
+        self,
+        X_test_scaled: np.ndarray,
+        quantile_levels: List[float] = None,
+    ) -> Dict[float, np.ndarray]:
+        # Return quantile forecasts in original scale for each requested level
+        if quantile_levels is None:
+            quantile_levels = [0.025, 0.1, 0.25, 0.5, 0.75, 0.9, 0.975]
+
+        y_pred_params = self.model.keras_model.predict(X_test_scaled, verbose=0)
+        params_flat = y_pred_params.reshape(-1, y_pred_params.shape[-1])
+        q_dict_scaled = self.model.head.quantiles(params_flat, quantile_levels)
+
+        q_original = {}
+        for q in quantile_levels:
+            q_scaled = q_dict_scaled[q].reshape(y_pred_params.shape[0], -1)
+            _, q_inv = self.transform.inverse_transform(X=None, y=q_scaled)
+            q_original[q] = q_inv
+        return q_original
+
+    def generate_samples(
+        self,
+        X_test_scaled: np.ndarray,
+        n_samples: int = 200,
+    ) -> np.ndarray:
+        # Return distribution samples in original scale
+        y_pred_params = self.model.keras_model.predict(X_test_scaled, verbose=0)
+        params_flat = y_pred_params.reshape(-1, y_pred_params.shape[-1])
+        samples_scaled = self.model.head.sample(params_flat, n_samples)
+        # samples_scaled shape from head: (n_features, n_samples) -> reshape
+        samples_scaled = samples_scaled.reshape(n_samples, y_pred_params.shape[0], -1)
+        samples_flat = samples_scaled.reshape(-1, samples_scaled.shape[-1])
+        _, samples_flat_orig = self.transform.inverse_transform(X=None, y=samples_flat)
+        return samples_flat_orig.reshape(n_samples, y_pred_params.shape[0], -1)

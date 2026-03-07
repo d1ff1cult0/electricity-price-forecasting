@@ -4,3 +4,5 @@
 /latex/
 /results/
 .env
+/__pychache__/
+/core/__pycache__/
