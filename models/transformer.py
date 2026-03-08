@@ -420,8 +420,8 @@ class HybridProbabilisticTransformer(ProbabilisticTransformer):
 
         print("Fitting OU Process on training residuals: ")
         
-        # Predict in large batches
-        y_pred_dist = self.keras_model.predict(X_train, batch_size=2048, verbose=0)
+        # Predict in small batches to avoid GPU OOM (especially after training)
+        y_pred_dist = self.keras_model.predict(X_train, batch_size=256, verbose=0)
         
         if hasattr(self.head, "mean"):
             flat_params = y_pred_dist.reshape(-1, y_pred_dist.shape[-1])
@@ -558,7 +558,7 @@ class HybridProbabilisticTransformerCIR(HybridProbabilisticTransformer):
     def fit_ou(self, X_train, y_train):
         # Fit CIR on max(residuals, 0) + epsilon
         print("Fitting CIR process on training residuals")
-        y_pred_dist = self.keras_model.predict(X_train, batch_size=2048, verbose=0)
+        y_pred_dist = self.keras_model.predict(X_train, batch_size=256, verbose=0)
 
         if hasattr(self.head, "mean"):
             flat_params = y_pred_dist.reshape(-1, y_pred_dist.shape[-1])
@@ -613,4 +613,378 @@ class HybridProbabilisticTransformerPostHocFloor(HybridProbabilisticTransformer)
     def sample_hybrid(self, X, n_samples: int = 100, last_residuals: np.ndarray = None):
         samples = super().sample_hybrid(X, n_samples, last_residuals)
         return np.maximum(samples, 0.0)
+
+
+# OU + Compound Poisson (Levy jump-diffusion)
+class OUJumpProcess:
+    # Ornstein-Uhlenbeck + compound Poisson jumps (Levy process)
+    # dX = OU_dynamics + dJ, J = sum of N(t) jumps. Allows negative prices
+    def __init__(self, dt: float = 1.0):
+        self.dt = dt
+        self.k = 0.0
+        self.mu = 0.0
+        self.sigma = 0.0
+        self.lambda_jump = 0.0  # jump intensity (arrivals per unit time)
+        self.jump_mean = 0.0   # mean jump size (can be positive for spike bias)
+        self.jump_std = 0.0    # std of jump size
+
+    def fit(self, residuals: np.ndarray):
+        ou = OrnsteinUhlenbeckProcess(dt=self.dt)
+        ou.fit(residuals)
+        self.k = ou.k
+        self.mu = ou.mu
+        self.sigma = ou.sigma
+        # Estimate jump component from tail of residuals
+        abs_resid = np.abs(residuals - np.median(residuals))
+        threshold = np.percentile(abs_resid, 95)
+        jumps = residuals[np.abs(residuals - np.median(residuals)) > threshold] - np.median(residuals)
+        if len(jumps) > 5:
+            self.lambda_jump = min(len(jumps) / (len(residuals) * self.dt + 1e-10), 2.0)
+            self.jump_mean = float(np.mean(jumps))
+            self.jump_std = float(max(np.std(jumps), 1e-6))
+        else:
+            self.lambda_jump = 0.0
+            self.jump_mean = 0.0
+            self.jump_std = 0.0
+
+    def simulate(self, current_x: np.ndarray, steps: int, n_paths: int = 1) -> np.ndarray:
+        if np.ndim(current_x) == 0:
+            current_x = np.array([current_x])
+        n_samples = len(current_x)
+        paths = np.zeros((n_samples, steps, n_paths))
+        x_t = np.tile(current_x[:, np.newaxis], (1, n_paths))
+        k, mu, dt, sigma = self.k, self.mu, self.dt, self.sigma
+        lam, jmean, jstd = self.lambda_jump, self.jump_mean, self.jump_std
+
+        if k > 1e-12:
+            exp_neg_k_dt = np.exp(-k * dt)
+            cond_var = (sigma**2 / (2.0 * k)) * (1.0 - np.exp(-2.0 * k * dt))
+            cond_std = np.sqrt(max(cond_var, 0.0))
+        else:
+            exp_neg_k_dt = 1.0
+            cond_std = sigma * np.sqrt(dt)
+
+        for t in range(steps):
+            cond_mean = mu + (x_t - mu) * exp_neg_k_dt
+            noise = np.random.normal(0, 1, size=(n_samples, n_paths))
+            x_t = cond_mean + cond_std * noise
+            # Add compound Poisson jumps
+            n_jumps = np.random.poisson(lam * dt, size=(n_samples, n_paths))
+            for _ in range(int(np.max(n_jumps))):
+                mask = n_jumps > 0
+                jump_sizes = np.random.normal(jmean, max(jstd, 1e-8), size=(n_samples, n_paths))
+                x_t = np.where(mask, x_t + jump_sizes, x_t)
+                n_jumps = np.maximum(n_jumps - 1, 0)
+            paths[:, t, :] = x_t
+        return paths
+
+    def mean_path(self, current_x: np.ndarray, steps: int) -> np.ndarray:
+        if np.ndim(current_x) == 0:
+            current_x = np.array([current_x])
+        n_samples = len(current_x)
+        path = np.zeros((n_samples, steps))
+        k, mu, dt, jmean, lam = self.k, self.mu, self.dt, self.jump_mean, self.lambda_jump
+        for t in range(steps):
+            elapsed = (t + 1) * dt
+            if k > 1e-12:
+                path[:, t] = mu + (current_x - mu) * np.exp(-k * elapsed)
+            else:
+                path[:, t] = current_x
+            path[:, t] += lam * dt * jmean  # mean jump contribution
+        return path
+
+
+class HybridProbabilisticTransformerOUJump(HybridProbabilisticTransformer):
+    # Hybrid Transformer + OU with compound Poisson jumps (Levy process
+
+    def __init__(self, config: ExperimentConfig):
+        super().__init__(config)
+        self.ou_process = OUJumpProcess(dt=1.0)
+
+
+# Soft barrier OU (prices repelled from below zero, but can go negative)
+class SoftBarrierOUProcess:
+    #OU with soft floor: when x < 0, mean-revert toward 0 when x >= 0, toward mu
+    # Creates tendency to cluster just above zero without hard truncation
+
+    def __init__(self, dt: float = 1.0):
+        self.dt = dt
+        self.k = 0.0
+        self.mu = 0.0
+        self.sigma = 0.0
+
+    def fit(self, residuals: np.ndarray):
+        ou = OrnsteinUhlenbeckProcess(dt=self.dt)
+        ou.fit(residuals)
+        self.k = ou.k
+        self.mu = ou.mu
+        self.sigma = ou.sigma
+
+    def _target(self, x: np.ndarray) -> np.ndarray:
+        return np.where(x < 0, 0.0, self.mu)
+
+    def simulate(self, current_x: np.ndarray, steps: int, n_paths: int = 1) -> np.ndarray:
+        if np.ndim(current_x) == 0:
+            current_x = np.array([current_x])
+        n_samples = len(current_x)
+        paths = np.zeros((n_samples, steps, n_paths))
+        x_t = np.tile(current_x[:, np.newaxis], (1, n_paths))
+        k, dt, sigma = self.k, self.dt, self.sigma
+
+        if k > 1e-12:
+            exp_neg_k_dt = np.exp(-k * dt)
+            cond_var = (sigma**2 / (2.0 * k)) * (1.0 - np.exp(-2.0 * k * dt))
+            cond_std = np.sqrt(max(cond_var, 0.0))
+        else:
+            exp_neg_k_dt = 1.0
+            cond_std = sigma * np.sqrt(dt)
+
+        for t in range(steps):
+            target = self._target(x_t)
+            cond_mean = target + (x_t - target) * exp_neg_k_dt
+            noise = np.random.normal(0, 1, size=(n_samples, n_paths))
+            x_t = cond_mean + cond_std * noise
+            paths[:, t, :] = x_t
+        return paths
+
+    def mean_path(self, current_x: np.ndarray, steps: int) -> np.ndarray:
+        if np.ndim(current_x) == 0:
+            current_x = np.array([current_x])
+        n_samples = len(current_x)
+        path = np.zeros((n_samples, steps))
+        k, mu, dt = self.k, self.mu, self.dt
+        x = current_x.copy()
+        for t in range(steps):
+            elapsed = (t + 1) * dt
+            target = np.where(x < 0, 0.0, mu)
+            if k > 1e-12:
+                x = target + (x - target) * np.exp(-k * elapsed)
+            path[:, t] = x
+        return path
+
+
+class HybridProbabilisticTransformerSoftBarrierOU(HybridProbabilisticTransformer):
+    # Hybrid Transformer + OU with soft floor near zero (no hard truncation)
+
+    def __init__(self, config: ExperimentConfig):
+        super().__init__(config)
+        self.ou_process = SoftBarrierOUProcess(dt=1.0)
+
+    def fit_ou(self, X_train, y_train):
+        super().fit_ou(X_train, y_train)  # uses parent to get k, mu, sigma
+
+
+# Asymmetric jump-diffusion (larger upward spikes than downward)
+class AsymmetricJumpProcess:
+    # OU + two-sided compound Poisson: positive jumps (spikes) larger than negative
+    # Captures asymmetric volatility: upward spikes dominate
+
+    def __init__(self, dt: float = 1.0):
+        self.dt = dt
+        self.k = 0.0
+        self.mu = 0.0
+        self.sigma = 0.0
+        self.lam_up = 0.0
+        self.lam_down = 0.0
+        self.theta_up = 10.0   # mean positive jump (spikes)
+        self.theta_down = 5.0  # mean negative jump (smaller)
+
+    def fit(self, residuals: np.ndarray):
+        ou = OrnsteinUhlenbeckProcess(dt=self.dt)
+        ou.fit(residuals)
+        self.k = ou.k
+        self.mu = ou.mu
+        self.sigma = ou.sigma
+        med = np.median(residuals)
+        pos_jumps = residuals[residuals > med + np.std(residuals) * 0.5] - med
+        neg_jumps = med - residuals[residuals < med - np.std(residuals) * 0.5]
+        n = len(residuals) * self.dt + 1e-10
+        if len(pos_jumps) > 3:
+            self.lam_up = min(len(pos_jumps) / n, 2.0)
+            self.theta_up = float(max(np.mean(pos_jumps), 1.0))
+        if len(neg_jumps) > 3:
+            self.lam_down = min(len(neg_jumps) / n, 2.0)
+            self.theta_down = float(max(np.mean(neg_jumps), 0.5))
+
+    def simulate(self, current_x: np.ndarray, steps: int, n_paths: int = 1) -> np.ndarray:
+        if np.ndim(current_x) == 0:
+            current_x = np.array([current_x])
+        n_samples = len(current_x)
+        paths = np.zeros((n_samples, steps, n_paths))
+        x_t = np.tile(current_x[:, np.newaxis], (1, n_paths))
+        k, mu, dt, sigma = self.k, self.mu, self.dt, self.sigma
+        lam_u, lam_d = self.lam_up, self.lam_down
+        th_u, th_d = self.theta_up, self.theta_down
+
+        if k > 1e-12:
+            exp_neg_k_dt = np.exp(-k * dt)
+            cond_var = (sigma**2 / (2.0 * k)) * (1.0 - np.exp(-2.0 * k * dt))
+            cond_std = np.sqrt(max(cond_var, 0.0))
+        else:
+            exp_neg_k_dt = 1.0
+            cond_std = sigma * np.sqrt(dt)
+
+        for t in range(steps):
+            cond_mean = mu + (x_t - mu) * exp_neg_k_dt
+            noise = np.random.normal(0, 1, size=(n_samples, n_paths))
+            x_t = cond_mean + cond_std * noise
+            n_up = np.random.poisson(lam_u * dt, size=(n_samples, n_paths))
+            n_dn = np.random.poisson(lam_d * dt, size=(n_samples, n_paths))
+            for _ in range(int(max(np.max(n_up), np.max(n_dn)))):
+                up_mask = n_up > 0
+                dn_mask = n_dn > 0
+                x_t = np.where(up_mask, x_t + np.random.exponential(th_u, size=(n_samples, n_paths)), x_t)
+                x_t = np.where(dn_mask, x_t - np.random.exponential(th_d, size=(n_samples, n_paths)), x_t)
+                n_up, n_dn = np.maximum(n_up - 1, 0), np.maximum(n_dn - 1, 0)
+            paths[:, t, :] = x_t
+        return paths
+
+    def mean_path(self, current_x: np.ndarray, steps: int) -> np.ndarray:
+        if np.ndim(current_x) == 0:
+            current_x = np.array([current_x])
+        n_samples = len(current_x)
+        path = np.zeros((n_samples, steps))
+        k, mu, dt, lam_u, lam_d, th_u, th_d = (
+            self.k, self.mu, self.dt, self.lam_up, self.lam_down,
+            self.theta_up, self.theta_down
+        )
+        for t in range(steps):
+            elapsed = (t + 1) * dt
+            if k > 1e-12:
+                path[:, t] = mu + (current_x - mu) * np.exp(-k * elapsed)
+            else:
+                path[:, t] = current_x
+            path[:, t] += (lam_u * th_u - lam_d * th_d) * dt
+            current_x = path[:, t]
+        return path
+
+
+class HybridProbabilisticTransformerAsymmetricJump(HybridProbabilisticTransformer):
+    # Hybrid Transformer + OU with asymmetric jumps (larger upward spikes)
+
+    def __init__(self, config: ExperimentConfig):
+        super().__init__(config)
+        self.ou_process = AsymmetricJumpProcess(dt=1.0)
+
+    def fit_ou(self, X_train, y_train):
+        print("Fitting Asymmetric Jump process on training residuals...")
+        y_pred_dist = self.keras_model.predict(X_train, batch_size=256, verbose=0)
+        flat_params = y_pred_dist.reshape(-1, y_pred_dist.shape[-1])
+        y_pred_means = self.head.mean(flat_params).reshape(y_train.shape)
+        all_residuals = y_train - y_pred_means
+        self.ou_process.fit(all_residuals.flatten())
+        self._train_residuals = all_residuals
+        print(f"  OU: k={self.ou_process.k:.4f}, mu={self.ou_process.mu:.4f}, sigma={self.ou_process.sigma:.4f}")
+        print(f"  Jumps: lam_up={self.ou_process.lam_up:.4f} (θ_up={self.ou_process.theta_up:.2f}), "
+              f"lam_down={self.ou_process.lam_down:.4f} (θ_down={self.ou_process.theta_down:.2f})")
+
+
+# Hour-specific OU (different variance per hour of day)
+class HourlyOUProcess:
+    # 24 OU processes, one per hour of day. Captures higher variance at peak hours
+
+    def __init__(self, dt: float = 1.0):
+        self.dt = dt
+        self.ou_per_hour = [OrnsteinUhlenbeckProcess(dt=dt) for _ in range(24)]
+
+    def fit(self, residuals: np.ndarray, hour_indices: np.ndarray):
+        # residuals: (n_windows, horizon), hour_indices: (n_windows, horizon) with values 0-23
+        for h in range(24):
+            mask = hour_indices == h
+            r = residuals[mask]
+            if len(r) > 10:
+                self.ou_per_hour[h].fit(r)
+
+    def simulate(self, current_x: np.ndarray, steps: int, n_paths: int,
+                 hour_0: int) -> np.ndarray:
+        # hour_0 = hour of first forecast step (0-23)
+        if np.ndim(current_x) == 0:
+            current_x = np.array([current_x])
+        n_samples = len(current_x)
+        paths = np.zeros((n_samples, steps, n_paths))
+        x_t = np.tile(current_x[:, np.newaxis], (1, n_paths))
+        for t in range(steps):
+            h = (hour_0 + t) % 24
+            ou = self.ou_per_hour[h]
+            # Flatten to simulate each (sample, path) independently
+            current_flat = x_t.flatten()
+            step_sim = ou.simulate(current_flat, 1, 1)
+            x_t = step_sim[:, 0, 0].reshape(n_samples, n_paths)
+            paths[:, t, :] = x_t
+        return paths
+
+    def mean_path(self, current_x: np.ndarray, steps: int, hour_0: int) -> np.ndarray:
+        if np.ndim(current_x) == 0:
+            current_x = np.array([current_x])
+        n_samples = len(current_x)
+        path = np.zeros((n_samples, steps))
+        x = current_x.copy()
+        for t in range(steps):
+            h = (hour_0 + t) % 24
+            ou = self.ou_per_hour[h]
+            step_mean = ou.mean_path(x, 1)
+            x = step_mean[:, 0]
+            path[:, t] = x
+        return path
+
+
+class HybridProbabilisticTransformerHourlyOU(HybridProbabilisticTransformer):
+    # Hybrid Transformer + OU with different parameters per hour of day
+
+    def __init__(self, config: ExperimentConfig):
+        super().__init__(config)
+        self.ou_process = HourlyOUProcess(dt=1.0)
+        self._hour_col_idx = (config.head_params or {}).get("hour_col_idx", 1)
+
+    def fit_ou(self, X_train, y_train):
+        print("Fitting Hourly OU (24 processes)...")
+        y_pred_dist = self.keras_model.predict(X_train, batch_size=256, verbose=0)
+        flat_params = y_pred_dist.reshape(-1, y_pred_dist.shape[-1])
+        y_pred_means = self.head.mean(flat_params).reshape(y_train.shape)
+        all_residuals = y_train - y_pred_means
+        n_windows, horizon = all_residuals.shape
+
+        # Get hour for each (window, step): last input hour + 1 + step
+        last_hours = X_train[:, -1, self._hour_col_idx].astype(int) % 24
+        hour_indices = np.zeros_like(all_residuals, dtype=int)
+        for t in range(horizon):
+            hour_indices[:, t] = (last_hours + 1 + t) % 24
+
+        self.ou_process.fit(all_residuals, hour_indices)
+        self._train_residuals = all_residuals
+        print("  Fitted 24 hourly OU processes.")
+
+    def compute_last_residual(self, X) -> np.ndarray:
+        return super().compute_last_residual(X)
+
+    def predict_hybrid(self, X, last_residuals: np.ndarray = None):
+        y_pred_dist = self.keras_model.predict(X, verbose=0)
+        flat_params = y_pred_dist.reshape(-1, y_pred_dist.shape[-1])
+        y_pred_means = self.head.mean(flat_params).reshape(X.shape[0], -1)
+        if last_residuals is None:
+            last_residuals = self.compute_last_residual(X)
+        horizon = y_pred_means.shape[1]
+        last_hours = (X[:, -1, self._hour_col_idx].astype(int) % 24)
+        ou_correction = np.zeros_like(y_pred_means)
+        for i in range(X.shape[0]):
+            ou_correction[i] = self.ou_process.mean_path(
+                np.array([last_residuals[i]]), horizon, int(last_hours[i])
+            ).flatten()
+        return y_pred_means + ou_correction
+
+    def sample_hybrid(self, X, n_samples: int = 100, last_residuals: np.ndarray = None):
+        y_pred_dist = self.keras_model.predict(X, verbose=0)
+        flat_params = y_pred_dist.reshape(-1, y_pred_dist.shape[-1])
+        tf_samples = self.head.sample(flat_params, n_samples)
+        transformer_samples = tf_samples.T.reshape(X.shape[0], -1, n_samples)
+        if last_residuals is None:
+            last_residuals = self.compute_last_residual(X)
+        horizon = transformer_samples.shape[1]
+        last_hours = (X[:, -1, self._hour_col_idx].astype(int) % 24)
+        ou_paths = np.zeros((X.shape[0], horizon, n_samples))
+        for i in range(X.shape[0]):
+            ou_paths[i] = self.ou_process.simulate(
+                np.array([last_residuals[i]]), horizon, n_samples, int(last_hours[i])
+            )
+        return transformer_samples + ou_paths
 

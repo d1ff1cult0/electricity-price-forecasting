@@ -45,6 +45,8 @@ N_RUNS = 10
 
 QUANTILE_LEVELS = [0.025, 0.1, 0.25, 0.5, 0.75, 0.9, 0.975]
 
+# Bump when data pipeline or evaluation changes so stale disk caches are ignored
+EXPERIMENT_VERSION = "v2"
 
 DataBundle = namedtuple("DataBundle", [
     "X_train_s", "y_train_s",
@@ -274,7 +276,10 @@ def save_summary(
         avg[k] = float(np.mean(vals)) if vals else None
         std[k] = float(np.std(vals)) if vals else None
 
-    summary = {"avg": avg, "std": std, "n_runs": len(all_run_metrics)}
+    summary = {
+        "avg": avg, "std": std, "n_runs": len(all_run_metrics),
+        "experiment_version": EXPERIMENT_VERSION,
+    }
     if config_dict:
         summary["config"] = config_dict
     with open(results_dir / "summary.json", "w") as f:
@@ -301,8 +306,10 @@ def load_cache(cache_file) -> Dict[str, Any]:
     cache_file = Path(cache_file)
     if cache_file.exists():
         try:
-            with open(cache_file, "r") as f:
-                return json.load(f)
+            raw = json.load(open(cache_file, "r"))
+            if raw.get("_version") != EXPERIMENT_VERSION:
+                return {}
+            return {k: v for k, v in raw.items() if not k.startswith("_")}
         except json.JSONDecodeError:
             return {}
     return {}
@@ -311,8 +318,9 @@ def load_cache(cache_file) -> Dict[str, Any]:
 def save_cache(cache_file, cache: Dict[str, Any]) -> None:
     cache_file = Path(cache_file)
     cache_file.parent.mkdir(parents=True, exist_ok=True)
+    out = {"_version": EXPERIMENT_VERSION, **cache}
     with open(cache_file, "w") as f:
-        json.dump(cache, f, indent=2)
+        json.dump(out, f, indent=2)
 
 
 
@@ -373,11 +381,14 @@ def run_experiment(
             with open(summary_file, "r") as f:
                 summary = json.load(f)
             avg = summary.get("avg", {})
-            if avg:
+            cached_version = summary.get("experiment_version")
+            if avg and cached_version == EXPERIMENT_VERSION:
                 print(f"[{exp_name}] found on disk ({summary_file}) — skipping.")
                 if cache is not None:
                     cache[exp_name] = avg
                 return avg
+            if avg and cached_version != EXPERIMENT_VERSION:
+                print(f"[{exp_name}] disk cache is stale (version {cached_version}), re-running.")
         except (json.JSONDecodeError, KeyError):
             pass
 

@@ -8,6 +8,10 @@ from .transformer import (
     HybridProbabilisticTransformerReflectedOU,
     HybridProbabilisticTransformerCIR,
     HybridProbabilisticTransformerPostHocFloor,
+    HybridProbabilisticTransformerOUJump,
+    HybridProbabilisticTransformerHourlyOU,
+    HybridProbabilisticTransformerSoftBarrierOU,
+    HybridProbabilisticTransformerAsymmetricJump,
 )
 from .heads import JohnsonSUHead, GaussianHead, DistributionHead
 try:
