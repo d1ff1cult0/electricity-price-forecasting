@@ -291,6 +291,12 @@ def save_summary(
     return avg, std
 
 
+def run_exists(results_dir: Path, run_idx: int) -> bool:
+    """Check if a run directory exists with valid metrics and predictions."""
+    run_dir = results_dir / f"run_{run_idx}"
+    return (run_dir / "metrics.json").exists() and (run_dir / "predictions.npz").exists()
+
+
 def load_run(results_dir: str, run_idx: int) -> Tuple[Dict, Dict[str, np.ndarray]]:
     # Reload a single run's metrics and predictions
     run_dir = Path(results_dir) / f"run_{run_idx}"
@@ -387,6 +393,15 @@ def run_experiment(
                 if cache is not None:
                     cache[exp_name] = avg
                 return avg
+            if avg and cached_version is None:
+                # Migrate: patch unversioned summary (e.g. from older code or crash recovery)
+                summary["experiment_version"] = EXPERIMENT_VERSION
+                with open(summary_file, "w") as f:
+                    json.dump(summary, f, indent=2)
+                print(f"[{exp_name}] found on disk (unversioned, patched) — skipping.")
+                if cache is not None:
+                    cache[exp_name] = avg
+                return avg
             if avg and cached_version != EXPERIMENT_VERSION:
                 print(f"[{exp_name}] disk cache is stale (version {cached_version}), re-running.")
         except (json.JSONDecodeError, KeyError):
@@ -414,6 +429,16 @@ def run_experiment(
     all_metrics: List[Dict[str, float]] = []
 
     for r in range(n_runs):
+        if run_exists(results_dir, r):
+            try:
+                metrics, _ = load_run(str(results_dir), r)
+                all_metrics.append(metrics)
+                print(f"  Run {r + 1}/{n_runs} ... loaded from disk")
+            except Exception as e:
+                print(f"  Run {r + 1}/{n_runs} ... load failed ({e}), re-training")
+            else:
+                continue
+
         print(f"  Run {r + 1}/{n_runs} ...")
         tf.keras.backend.clear_session()
         gc.collect()
