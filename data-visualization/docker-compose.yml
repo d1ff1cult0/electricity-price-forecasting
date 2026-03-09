@@ -1,0 +1,8 @@
+services:
+  electricity-viz:
+    build: .
+    ports:
+      - "3005:3005"
+    volumes:
+      - /home/d1ff1cult/masterproef_new/results:/home/d1ff1cult/masterproef_new/results:ro
+    restart: unless-stopped
