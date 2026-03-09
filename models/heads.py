@@ -200,6 +200,28 @@ class GaussianHead(DistributionHead):
         return log_pdf
 
 
+class GaussianCRPSHead(GaussianHead):
+    # Gaussian head trained with CRPS loss instead of NLL
+
+    def loss(self, y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
+        if len(y_true.shape) == 3:
+            y_true = tf.squeeze(y_true, axis=-1)
+
+        mu, sigma = self._split_params(y_pred)
+        z = (y_true - mu) / (sigma + 1e-10)
+
+        # CRPS(N(mu, sigma), y) = sigma * (z*(2*Phi(z)-1) + 2*phi(z) - 1/sqrt(pi))
+        sqrt_pi = np.sqrt(np.pi)
+        phi_z = tf.exp(-0.5 * tf.square(z)) / tf.sqrt(2.0 * np.pi)
+        Phi_z = 0.5 * (1.0 + tf.math.erf(z / tf.sqrt(2.0)))
+        crps = sigma * (
+            z * (2.0 * Phi_z - 1.0)
+            + 2.0 * phi_z
+            - 1.0 / sqrt_pi
+        )
+        return tf.reduce_mean(crps)
+
+
 class QuantileHead(DistributionHead):
     # Non-parametric quantile regression head (Outputs a set of quantiles directly which minimized pinball loss)
 
@@ -403,12 +425,17 @@ class MixtureGaussianHead(DistributionHead):
         return means
 
     def quantiles(self, params: np.ndarray, q_list: List[float]) -> Dict[float, np.ndarray]:
-        n_approx_samples = 10000
-        samples = self.sample(params, n_approx_samples)
-        
-        results = {}
-        for q in q_list:
-            results[q] = np.quantile(samples, q, axis=0)
+        # Process in batches to avoid OOM with large test sets
+        n_approx_samples = 2000
+        batch_size = 5000
+        n_points = params.shape[0]
+        results = {q: np.zeros(n_points, dtype=np.float64) for q in q_list}
+        for start in range(0, n_points, batch_size):
+            end = min(start + batch_size, n_points)
+            batch = params[start:end]
+            samples = self.sample(batch, n_approx_samples)
+            for q in q_list:
+                results[q][start:end] = np.quantile(samples, q, axis=0)
         return results
 
 
@@ -509,12 +536,17 @@ class MixtureJohnsonSUHead(DistributionHead):
         return np.sum(weights * component_means, axis=1)
 
     def quantiles(self, params: np.ndarray, q_list: List[float]) -> Dict[float, np.ndarray]:
-        # Approximate
-        n_approx_samples = 10000
-        samples = self.sample(params, n_approx_samples)
-        results = {}
-        for q in q_list:
-            results[q] = np.quantile(samples, q, axis=0)
+        # Approximate via sampling: process in batches to avoid OOM with large test sets
+        n_approx_samples = 2000
+        batch_size = 5000
+        n_points = params.shape[0]
+        results = {q: np.zeros(n_points, dtype=np.float64) for q in q_list}
+        for start in range(0, n_points, batch_size):
+            end = min(start + batch_size, n_points)
+            batch = params[start:end]
+            samples = self.sample(batch, n_approx_samples)  # (n_approx_samples, batch_len)
+            for q in q_list:
+                results[q][start:end] = np.quantile(samples, q, axis=0)
         return results
 
 
@@ -563,6 +595,192 @@ class JohnsonSUFloorHead(JohnsonSUHead):
         )
 
         return base_nll + self.floor_penalty_weight * floor_penalty + 0.1 * asym_penalty
+
+
+class MoEJohnsonSUHead(DistributionHead):
+    # Mixture-of-Experts head: K separate Johnson SU experts with a learned gating network
+    # Each expert has its own dense layers to encourage regime specialisation (normal, spike, low/negative prices).
+
+    def __init__(self, n_experts: int = 3, balance_weight: float = 0.01):
+        self.n_experts = n_experts
+        self.balance_weight = balance_weight
+
+    def build_output_layer(self, x: tf.Tensor, horizon: int) -> tf.Tensor:
+        K = self.n_experts
+
+        gate = layers.Dense(64, activation="relu", name="moe_gate_hidden")(x)
+        gate = layers.Dropout(0.1)(gate)
+        gate_logits = layers.Dense(horizon * K, name="moe_gate_logits")(gate)
+        gate_logits = layers.Reshape((horizon, K), name="moe_gate_reshape")(gate_logits)
+
+        expert_outputs = []
+        for k in range(K):
+            h = layers.Dense(128, activation="relu", name=f"moe_expert_{k}_h")(x)
+            h = layers.Dropout(0.1)(h)
+            ek = layers.Dense(horizon * 4, name=f"moe_expert_{k}_params")(h)
+            ek = layers.Reshape((horizon, 4), name=f"moe_expert_{k}_reshape")(ek)
+            expert_outputs.append(ek)
+
+        all_experts = layers.Concatenate(axis=-1, name="moe_experts_cat")(expert_outputs)
+        output = layers.Concatenate(axis=-1, name="moe_output")([all_experts, gate_logits])
+        return output  # (batch, horizon, K*4 + K)
+
+    # TF loss
+    def loss(self, y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
+        if len(y_true.shape) == 3:
+            y_true = tf.squeeze(y_true, axis=-1)
+
+        K = self.n_experts
+        expert_params = y_pred[..., :K * 4]
+        gate_logits = y_pred[..., K * 4:]
+
+        shape = tf.shape(y_pred)
+        expert_r = tf.reshape(expert_params, (shape[0], shape[1], K, 4))
+        gamma = expert_r[..., 0]
+        delta = tf.nn.softplus(expert_r[..., 1]) + 1e-6
+        xi = expert_r[..., 2]
+        lam = tf.nn.softplus(expert_r[..., 3]) + 1e-6
+
+        y_ex = tf.expand_dims(y_true, -1)
+        z = (y_ex - xi) / lam
+        asinh_z = tf.asinh(z)
+        log_pdf_k = (
+            tf.math.log(delta)
+            - tf.math.log(lam)
+            - 0.5 * tf.math.log(2.0 * np.pi)
+            - 0.5 * tf.square(gamma + delta * asinh_z)
+            - 0.5 * tf.math.log(1.0 + tf.square(z) + 1e-8)
+        )
+
+        log_w = tf.nn.log_softmax(gate_logits, axis=-1)
+        log_mixture = tf.reduce_logsumexp(log_w + log_pdf_k, axis=-1)
+        nll = -tf.reduce_mean(log_mixture)
+
+        w = tf.nn.softmax(gate_logits, axis=-1)
+        avg_usage = tf.reduce_mean(w, axis=[0, 1])
+        balance = tf.cast(K, tf.float32) * tf.reduce_sum(tf.square(avg_usage))
+
+        return nll + self.balance_weight * balance
+
+    def _parse_params(self, params: np.ndarray):
+        K = self.n_experts
+        n = params.shape[0]
+        expert_raw = params[:, :K * 4].reshape(n, K, 4)
+        gate_logits = params[:, K * 4:]
+
+        max_g = np.max(gate_logits, axis=-1, keepdims=True)
+        weights = np.exp(gate_logits - max_g)
+        weights /= weights.sum(axis=-1, keepdims=True)
+
+        gamma = np.nan_to_num(expert_raw[..., 0], nan=0.0)
+        delta = np.clip(
+            _np_softplus(np.nan_to_num(expert_raw[..., 1], nan=1.0)) + 1e-6,
+            1e-6, 1e6,
+        )
+        xi = np.nan_to_num(expert_raw[..., 2], nan=0.0)
+        lam = np.clip(
+            _np_softplus(np.nan_to_num(expert_raw[..., 3], nan=1.0)) + 1e-6,
+            1e-6, 1e6,
+        )
+        return weights, gamma, delta, xi, lam
+
+    def mean(self, params: np.ndarray) -> np.ndarray:
+        weights, gamma, delta, xi, lam = self._parse_params(params)
+        expert_means = (
+            xi
+            - lam
+            * np.exp(0.5 / (delta ** 2 + 1e-8))
+            * np.sinh(gamma / (delta + 1e-8))
+        )
+        return np.sum(weights * expert_means, axis=-1)
+
+    def sample(self, params: np.ndarray, n_samples: int) -> np.ndarray:
+        K = self.n_experts
+        n_points = params.shape[0]
+        weights, gamma, delta, xi, lam = self._parse_params(params)
+
+        u = np.random.uniform(size=(n_samples, n_points))
+        cum_w = np.cumsum(weights, axis=-1)
+        expert_idx = np.sum(
+            u[:, :, np.newaxis] > cum_w[np.newaxis, :, :], axis=-1,
+        ).astype(int)
+        expert_idx = np.clip(expert_idx, 0, K - 1)
+
+        z = np.random.normal(size=(n_samples, n_points))
+        samples = np.zeros((n_samples, n_points))
+
+        for k in range(K):
+            mask = expert_idx == k
+            if not mask.any():
+                continue
+            jsu_vals = (
+                xi[np.newaxis, :, k]
+                + lam[np.newaxis, :, k]
+                * np.sinh((z - gamma[np.newaxis, :, k]) / delta[np.newaxis, :, k])
+            )
+            samples = np.where(mask, jsu_vals, samples)
+
+        return samples
+
+    def quantiles(self, params: np.ndarray, q_list: List[float]) -> Dict[float, np.ndarray]:
+        # Process in batches to avoid OOM with large test sets (e.g. 37k+ points)
+        n_approx_samples = 2000
+        batch_size = 5000
+        n_points = params.shape[0]
+        results = {q: np.zeros(n_points, dtype=np.float64) for q in q_list}
+        for start in range(0, n_points, batch_size):
+            end = min(start + batch_size, n_points)
+            batch = params[start:end]
+            samples = self.sample(batch, n_approx_samples)
+            for q in q_list:
+                results[q][start:end] = np.quantile(samples, q, axis=0)
+        return results
+
+    def log_pdf_np(self, params: np.ndarray, y: np.ndarray) -> np.ndarray:
+        K = self.n_experts
+        orig_shape = y.shape
+        params_flat = params.reshape(-1, params.shape[-1])
+        y_flat = y.reshape(-1)
+        n = params_flat.shape[0]
+
+        expert_raw = params_flat[:, :K * 4].reshape(n, K, 4)
+        gate_logits = params_flat[:, K * 4:]
+
+        max_g = np.max(gate_logits, axis=-1, keepdims=True)
+        shifted = gate_logits - max_g
+        log_w = shifted - np.log(
+            np.sum(np.exp(shifted), axis=-1, keepdims=True) + 1e-10
+        )
+
+        gamma = np.nan_to_num(expert_raw[..., 0], nan=0.0)
+        delta = np.clip(
+            _np_softplus(np.nan_to_num(expert_raw[..., 1], nan=1.0)) + 1e-6,
+            1e-6, 1e6,
+        )
+        xi = np.nan_to_num(expert_raw[..., 2], nan=0.0)
+        lam = np.clip(
+            _np_softplus(np.nan_to_num(expert_raw[..., 3], nan=1.0)) + 1e-6,
+            1e-6, 1e6,
+        )
+
+        y_ex = y_flat[:, np.newaxis]
+        z = (y_ex - xi) / (lam + 1e-10)
+        asinh_z = np.arcsinh(np.clip(z, -1e10, 1e10))
+
+        log_pdfs = (
+            np.log(delta + 1e-10)
+            - np.log(lam + 1e-10)
+            - 0.5 * np.log(2.0 * np.pi)
+            - 0.5 * (gamma + delta * asinh_z) ** 2
+            - 0.5 * np.log(1.0 + z ** 2 + 1e-10)
+        )
+
+        weighted = log_w + log_pdfs
+        max_wt = np.max(weighted, axis=-1, keepdims=True)
+        log_mix = max_wt.squeeze(-1) + np.log(
+            np.sum(np.exp(weighted - max_wt), axis=-1) + 1e-10
+        )
+        return log_mix.reshape(orig_shape)
 
 
 class TruncatedNormalHead(DistributionHead):

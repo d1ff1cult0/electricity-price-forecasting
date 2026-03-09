@@ -14,9 +14,11 @@ from .heads import (
     JohnsonSUFloorHead,
     TruncatedNormalHead,
     GaussianHead,
+    GaussianCRPSHead,
     QuantileHead,
     MixtureGaussianHead,
     MixtureJohnsonSUHead,
+    MoEJohnsonSUHead,
 )
 
 class ProbabilisticTransformer:
@@ -35,6 +37,8 @@ class ProbabilisticTransformer:
             self.head = JohnsonSUHead()
         elif config.head_type == "gaussian":
             self.head = GaussianHead()
+        elif config.head_type == "gaussian_crps":
+            self.head = GaussianCRPSHead()
         elif config.head_type == "quantile":
             quantiles = head_params.get("quantiles", None)
             self.head = QuantileHead(quantiles=quantiles)
@@ -926,6 +930,20 @@ class HourlyOUProcess:
             x = step_mean[:, 0]
             path[:, t] = x
         return path
+
+
+class MoEProbabilisticTransformer(ProbabilisticTransformer):
+    # Mixture-of-Experts Transformer with separate expert networks and learned gating
+
+    def __init__(self, config: ExperimentConfig):
+        super().__init__(config)
+        head_params = config.head_params or {}
+        n_experts = head_params.get("n_experts", 3)
+        balance_weight = head_params.get("balance_weight", 0.01)
+        self.head = MoEJohnsonSUHead(
+            n_experts=n_experts,
+            balance_weight=balance_weight,
+        )
 
 
 class HybridProbabilisticTransformerHourlyOU(HybridProbabilisticTransformer):

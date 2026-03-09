@@ -4,6 +4,7 @@ import matplotlib.pyplot
 
 from .transformer import (
     ProbabilisticTransformer,
+    MoEProbabilisticTransformer,
     HybridProbabilisticTransformer,
     HybridProbabilisticTransformerReflectedOU,
     HybridProbabilisticTransformerCIR,
